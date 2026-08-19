@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>StudyForge — turn raw material into mastery</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <div class="grid-backdrop" aria-hidden="true"></div>
+
+  <header class="site-header">
+    <div class="wordmark">
+      <span class="wordmark-mark">&#9670;</span>
+      <span>STUDYFORGE</span>
+    </div>
+    <p class="tagline">Raw material in. Tempered mastery out.</p>
+  </header>
+
+  <main id="app">
+
+    <!-- ============ STAGE 1: INTAKE ============ -->
+    <section id="intake" class="stage">
+      <div class="furnace">
+        <h1 class="furnace-title">Feed the furnace</h1>
+        <p class="furnace-sub">Paste a lecture transcript, reading, or notes. StudyForge will forge it into a concept map, flashcards, and an adaptive quiz.</p>
+
+        <div class="input-tabs" role="tablist" aria-label="Choose input method">
+          <button class="input-tab active" data-tab="paste" role="tab" aria-selected="true">Paste text</button>
+          <button class="input-tab" data-tab="file" role="tab" aria-selected="false">Upload file</button>
+        </div>
+
+        <div class="input-panel" data-panel="paste">
+          <textarea id="source-text" placeholder="Paste your lecture transcript, reading, or notes here..." rows="10"></textarea>
+        </div>
+
+        <div class="input-panel" data-panel="file" hidden>
+          <label class="dropzone" for="file-input">
+            <span class="dropzone-icon">&#8613;</span>
+            <span id="dropzone-label">Drop a .txt or .pdf file, or click to browse</span>
+            <input type="file" id="file-input" accept=".txt,.pdf" hidden />
+          </label>
+        </div>
+
+        <div class="furnace-controls">
+          <span id="char-count" class="char-count">0 characters</span>
+          <button id="forge-btn" class="btn-primary">Forge study kit</button>
+        </div>
+
+        <p id="intake-error" class="error-msg" hidden></p>
+      </div>
+    </section>
+
+    <!-- ============ LOADING ============ -->
+    <section id="loading" class="stage" hidden>
+      <div class="forging-anim">
+        <div class="ember-pulse"></div>
+        <p id="loading-label">Heating the material&hellip;</p>
+      </div>
+    </section>
+
+    <!-- ============ STAGE 2: WORKSHOP ============ -->
+    <section id="workshop" class="stage" hidden>
+
+      <div class="workshop-header">
+        <h1 id="kit-title" class="kit-title"></h1>
+        <button id="restart-btn" class="btn-ghost">&#8592; Forge something new</button>
+      </div>
+
+      <nav class="tab-bar" role="tablist" aria-label="Study kit sections">
+        <button class="ws-tab active" data-target="panel-summary" role="tab" aria-selected="true">01 · Cheat sheet</button>
+        <button class="ws-tab" data-target="panel-map" role="tab" aria-selected="false">02 · Concept map</button>
+        <button class="ws-tab" data-target="panel-cards" role="tab" aria-selected="false">03 · Flashcards</button>
+        <button class="ws-tab" data-target="panel-quiz" role="tab" aria-selected="false">04 · Quiz</button>
+      </nav>
+
+      <div id="panel-summary" class="ws-panel active">
+        <div class="cheat-sheet">
+          <p id="summary-text"></p>
+        </div>
+      </div>
+
+      <div id="panel-map" class="ws-panel" hidden>
+        <p class="panel-hint">Mastery gauges cool from ember to steel as you prove you know a concept in the quiz.</p>
+        <ul id="concept-tree" class="concept-tree"></ul>
+      </div>
+
+      <div id="panel-cards" class="ws-panel" hidden>
+        <div class="flash-controls">
+          <button id="flash-prev" class="btn-ghost" aria-label="Previous flashcard">&#8592;</button>
+          <span id="flash-position" class="flash-position"></span>
+          <button id="flash-next" class="btn-ghost" aria-label="Next flashcard">&#8594;</button>
+        </div>
+        <div id="flashcard" class="flashcard" tabindex="0" role="button" aria-label="Flip flashcard">
+          <div class="flashcard-inner">
+            <div class="flashcard-face flashcard-front">
+              <span class="flashcard-label">Question</span>
+              <p id="flash-q"></p>
+            </div>
+            <div class="flashcard-face flashcard-back">
+              <span class="flashcard-label">Answer</span>
+              <p id="flash-a"></p>
+            </div>
+          </div>
+        </div>
+        <p class="flash-hint">Click the card to flip it</p>
+      </div>
+
+      <div id="panel-quiz" class="ws-panel" hidden>
+        <div id="quiz-progress" class="quiz-progress"></div>
+        <div id="quiz-body"></div>
+        <div id="quiz-complete" class="quiz-complete" hidden>
+          <h2>Quiz complete</h2>
+          <p id="quiz-score"></p>
+          <button id="retry-weak" class="btn-primary">Retry weak concepts only</button>
+        </div>
+      </div>
+
+    </section>
+
+  </main>
+
+  <footer class="site-footer">
+    <p>Built for the August AI Challenge &middot; StudyForge</p>
+  </footer>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
