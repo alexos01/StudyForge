@@ -43,43 +43,132 @@ CHUNK_SIZE = 9000
 MAX_CHUNKS = 8
 
 
-def _extract_json(raw_text: str) -> Any:
-    """Strip markdown code fences / stray prose and parse JSON safely."""
+def _strip_to_json_start(raw_text: str) -> str:
+    """Strip markdown code fences / any preamble before the JSON begins."""
     cleaned = raw_text.strip()
     cleaned = re.sub(r"^```(json)?", "", cleaned.strip())
     cleaned = re.sub(r"```$", "", cleaned.strip())
     cleaned = cleaned.strip()
     if not cleaned.startswith("{"):
         start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start != -1 and end != -1:
-            cleaned = cleaned[start : end + 1]
-    return json.loads(cleaned)
+        if start != -1:
+            cleaned = cleaned[start:]
+    return cleaned
+
+
+def _extract_json(raw_text: str) -> Any:
+    """Parse the first JSON object out of a model response. Uses raw_decode
+    (not json.loads) so trailing commentary after the JSON doesn't break
+    parsing - only an actually truncated/malformed object raises."""
+    cleaned = _strip_to_json_start(raw_text)
+    obj, _ = json.JSONDecoder().raw_decode(cleaned)
+    return obj
+
+
+def _repair_truncated_json(raw_text: str) -> str:
+    """Best-effort repair for a response that got cut off mid-generation
+    (e.g. hit the token limit mid-string or mid-object). Rather than trying
+    to guess how to close a half-written field - which can produce
+    plausible-looking but wrong JSON - this walks the text and remembers the
+    last point where a full element had just been completed (right before a
+    top-level comma), then closes brackets from there. Worst case it drops
+    the one in-progress item that got cut off; it never fabricates data."""
+    text = _strip_to_json_start(raw_text)
+    stack: list = []
+    in_string = False
+    escape = False
+    last_safe_cut = None  # (index, stack snapshot at that point)
+
+    for i, ch in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if stack:
+                stack.pop()
+        elif ch == "," and stack:
+            last_safe_cut = (i, list(stack))
+
+    closers = {"{": "}", "[": "]"}
+
+    if last_safe_cut is None:
+        # Nothing to safely cut back to. If we're still mid-string, terminate
+        # it so at least a partial value survives; then close whatever's open.
+        cut_text = text + '"' if in_string else text
+        cut_text = re.sub(r'[,:]\s*$', "", cut_text)
+        remaining = list(stack)
+        while remaining:
+            cut_text += closers[remaining.pop()]
+        return cut_text
+
+    idx, snapshot = last_safe_cut
+    cut_text = text[:idx]
+    remaining = list(snapshot)
+    while remaining:
+        cut_text += closers[remaining.pop()]
+    return cut_text
 
 
 def _chat_json(system_prompt: str, user_prompt: str, max_tokens: int) -> dict:
-    try:
-        response = client.chat.completions.create(
-            model=MODEL,
-            max_tokens=max_tokens,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
-    except Exception:
-        response = client.chat.completions.create(
-            model=MODEL,
-            max_tokens=max_tokens,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
+    def call(tokens: int):
+        try:
+            return client.chat.completions.create(
+                model=MODEL,
+                max_tokens=tokens,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+        except Exception:
+            return client.chat.completions.create(
+                model=MODEL,
+                max_tokens=tokens,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
 
-    raw_text = response.choices[0].message.content or ""
-    return _extract_json(raw_text)
+    response = call(max_tokens)
+    choice = response.choices[0]
+    raw_text = choice.message.content or ""
+
+    try:
+        return _extract_json(raw_text)
+    except (ValueError, json.JSONDecodeError):
+        pass
+
+    # If the model actually ran out of room, retrying with more headroom
+    # fixes it properly instead of just salvaging a partial response.
+    finish_reason = getattr(choice, "finish_reason", None)
+    if finish_reason == "length" and max_tokens < 8000:
+        bigger = min(max_tokens * 2, 8000)
+        response = call(bigger)
+        raw_text = response.choices[0].message.content or ""
+        try:
+            return _extract_json(raw_text)
+        except (ValueError, json.JSONDecodeError):
+            pass
+
+    # Last resort: repair whatever we got rather than fail the whole stage.
+    try:
+        return _extract_json(_repair_truncated_json(raw_text))
+    except (ValueError, json.JSONDecodeError) as e:
+        raise RuntimeError(
+            f"The model's response wasn't valid JSON and couldn't be repaired: {e}"
+        ) from e
 
 
 def _chat_text(system_prompt: str, user_prompt: str, max_tokens: int) -> str:
@@ -154,7 +243,7 @@ def extract_chunk_concepts(chunk: str, chunk_index: int, total_chunks: int) -> d
     user_prompt = (
         f"Excerpt {chunk_index + 1} of {total_chunks} from the source material:\n\n{chunk}"
     )
-    return _chat_json(CHUNK_EXTRACT_SYSTEM_PROMPT, user_prompt, max_tokens=2000)
+    return _chat_json(CHUNK_EXTRACT_SYSTEM_PROMPT, user_prompt, max_tokens=3000)
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +288,7 @@ def synthesize_kit(chunk_concept_lists: list, source_sample: str) -> dict:
         f"Raw concepts extracted from every part of the document:\n{raw_dump}\n\n"
         f"Sample of the original source text (for tone/grounding):\n{source_sample}"
     )
-    return _chat_json(SYNTHESIZE_SYSTEM_PROMPT, user_prompt, max_tokens=4000)
+    return _chat_json(SYNTHESIZE_SYSTEM_PROMPT, user_prompt, max_tokens=5000)
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +314,7 @@ def generate_flashcards(concepts: list, summary: str) -> dict:
         f"Summary:\n{summary}\n\nConcepts (cover every one):\n"
         f"{json.dumps(concepts, ensure_ascii=False, indent=1)}"
     )
-    return _chat_json(FLASHCARDS_SYSTEM_PROMPT, user_prompt, max_tokens=3000)
+    return _chat_json(FLASHCARDS_SYSTEM_PROMPT, user_prompt, max_tokens=3500)
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +346,7 @@ def generate_quiz(concepts: list, summary: str) -> dict:
         f"Summary:\n{summary}\n\nConcepts (test every one):\n"
         f"{json.dumps(concepts, ensure_ascii=False, indent=1)}"
     )
-    return _chat_json(QUIZ_SYSTEM_PROMPT, user_prompt, max_tokens=3500)
+    return _chat_json(QUIZ_SYSTEM_PROMPT, user_prompt, max_tokens=4000)
 
 
 # ---------------------------------------------------------------------------
