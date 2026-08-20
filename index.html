@@ -8,26 +8,61 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="style.css" />
+<script>
+  // Apply the saved theme before first paint to avoid a flash of the wrong theme.
+  (function () {
+    try {
+      var saved = localStorage.getItem("studyforge_theme") || "forge";
+      document.documentElement.setAttribute("data-theme", saved);
+    } catch (e) {}
+  })();
+</script>
 </head>
 <body>
 
   <div class="grid-backdrop" aria-hidden="true"></div>
 
   <header class="site-header">
-    <div class="wordmark">
-      <span class="wordmark-mark">&#9670;</span>
-      <span>STUDYFORGE</span>
+    <div class="header-left">
+      <div class="wordmark">
+        <span class="wordmark-mark">&#9670;</span>
+        <span>STUDYFORGE</span>
+      </div>
+      <p class="tagline">Raw material in. Tempered mastery out.</p>
     </div>
-    <p class="tagline">Raw material in. Tempered mastery out.</p>
+
+    <div class="header-right">
+      <div class="theme-switcher">
+        <label for="theme-select" class="visually-hidden">Theme</label>
+        <select id="theme-select">
+          <option value="forge">Forge (dark)</option>
+          <option value="daylight">Daylight (light)</option>
+          <option value="midnight">Midnight Focus</option>
+          <option value="contrast">High Contrast</option>
+        </select>
+      </div>
+      <button id="history-btn" class="btn-ghost">My kits</button>
+      <div id="auth-area"></div>
+    </div>
   </header>
 
   <main id="app">
+
+    <!-- ============ STAGE 0: HISTORY ============ -->
+    <section id="history" class="stage" hidden>
+      <div class="history-header">
+        <h1 class="furnace-title">Your study kits</h1>
+        <button id="history-close" class="btn-ghost">&#8592; Back</button>
+      </div>
+      <p id="history-empty" class="panel-hint" hidden>Nothing forged yet — go make your first study kit.</p>
+      <ul id="history-list" class="history-list"></ul>
+    </section>
 
     <!-- ============ STAGE 1: INTAKE ============ -->
     <section id="intake" class="stage">
       <div class="furnace">
         <h1 class="furnace-title">Feed the furnace</h1>
-        <p class="furnace-sub">Paste a lecture transcript, reading, or notes. StudyForge will forge it into a concept map, flashcards, and an adaptive quiz.</p>
+        <p class="furnace-sub">Paste a lecture transcript, reading, or notes. StudyForge will forge it into a concept map, flashcards, a quiz, short-answer practice, and a place to ask follow-up questions.</p>
 
         <div class="input-tabs" role="tablist" aria-label="Choose input method">
           <button class="input-tab active" data-tab="paste" role="tab" aria-selected="true">Paste text</button>
@@ -55,11 +90,12 @@
       </div>
     </section>
 
-    <!-- ============ LOADING ============ -->
+    <!-- ============ LOADING (real stage-by-stage progress) ============ -->
     <section id="loading" class="stage" hidden>
       <div class="forging-anim">
         <div class="ember-pulse"></div>
-        <p id="loading-label">Heating the material&hellip;</p>
+        <p id="loading-label">Starting up&hellip;</p>
+        <p id="loading-sublabel" class="loading-sublabel"></p>
       </div>
     </section>
 
@@ -76,6 +112,8 @@
         <button class="ws-tab" data-target="panel-map" role="tab" aria-selected="false">02 · Concept map</button>
         <button class="ws-tab" data-target="panel-cards" role="tab" aria-selected="false">03 · Flashcards</button>
         <button class="ws-tab" data-target="panel-quiz" role="tab" aria-selected="false">04 · Quiz</button>
+        <button class="ws-tab" data-target="panel-short" role="tab" aria-selected="false">05 · Short answer</button>
+        <button class="ws-tab" data-target="panel-ask" role="tab" aria-selected="false">06 · Ask</button>
       </nav>
 
       <div id="panel-summary" class="ws-panel active">
@@ -85,7 +123,7 @@
       </div>
 
       <div id="panel-map" class="ws-panel" hidden>
-        <p class="panel-hint">Mastery gauges cool from ember to steel as you prove you know a concept in the quiz.</p>
+        <p class="panel-hint">Mastery gauges cool from ember to steel to green as you prove you know a concept in the quiz.</p>
         <ul id="concept-tree" class="concept-tree"></ul>
       </div>
 
@@ -120,9 +158,46 @@
         </div>
       </div>
 
+      <div id="panel-short" class="ws-panel" hidden>
+        <p class="panel-hint">Write your answer in your own words — you'll get feedback on what's there and what's missing.</p>
+        <div id="short-answer-list"></div>
+      </div>
+
+      <div id="panel-ask" class="ws-panel" hidden>
+        <p class="panel-hint">Ask anything about this material. Answers are grounded in what you actually gave StudyForge.</p>
+        <div id="ask-thread" class="ask-thread"></div>
+        <form id="ask-form" class="ask-form">
+          <input id="ask-input" type="text" placeholder="e.g. What's the difference between X and Y?" autocomplete="off" />
+          <button type="submit" class="btn-primary">Ask</button>
+        </form>
+      </div>
+
     </section>
 
   </main>
+
+  <!-- ============ AUTH MODAL ============ -->
+  <div id="auth-modal" class="modal-backdrop" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="auth-modal-title">
+      <div class="modal-tabs">
+        <button class="modal-tab active" data-mode="login">Log in</button>
+        <button class="modal-tab" data-mode="signup">Sign up</button>
+      </div>
+      <h2 id="auth-modal-title" class="modal-title">Log in</h2>
+      <p class="modal-sub">Optional — only needed to sync your study kits across devices. Everything works without an account too.</p>
+      <form id="auth-form">
+        <label class="field-label" for="auth-email">Email</label>
+        <input id="auth-email" type="email" required autocomplete="email" />
+        <label class="field-label" for="auth-password">Password</label>
+        <input id="auth-password" type="password" required autocomplete="current-password" minlength="8" />
+        <p id="auth-error" class="error-msg" hidden></p>
+        <div class="modal-actions">
+          <button type="button" id="auth-cancel" class="btn-ghost">Cancel</button>
+          <button type="submit" id="auth-submit" class="btn-primary">Log in</button>
+        </div>
+      </form>
+    </div>
+  </div>
 
   <footer class="site-footer">
     <p>Built for the August AI Challenge &middot; StudyForge</p>

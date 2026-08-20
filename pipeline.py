@@ -1,27 +1,30 @@
 """
 pipeline.py
-Core AI pipeline for StudyForge.
+Core AI pipeline for StudyForge, split into discrete stages so that:
+  (a) the frontend can show real progress ("Extracting concepts" only shows
+      while that call is actually in flight), and
+  (b) long material gets full coverage instead of being silently truncated.
 
-Given raw source material (a lecture transcript, reading, or notes), this
-module turns it into a structured study kit:
-  1. A concept map (parent/child relationships between the key ideas)
-  2. Spaced-repetition-ready flashcards
-  3. A multiple-choice quiz, each question tagged to the concept it tests
-  4. A short cheat-sheet summary
+Stages:
+  1. chunk_text + extract_chunk_concepts (map)   -> one call per chunk
+  2. synthesize_kit (reduce)                     -> merges chunks into one
+                                                     concept map + summary
+  3. generate_flashcards
+  4. generate_quiz
+  5. generate_short_answer_questions
 
-It also powers the adaptive loop: when a student misses a quiz question,
-generate_targeted_explanation() re-explains *that specific concept*,
-grounded in the original source text, instead of a generic canned response.
+Plus, independent of the build pipeline:
+  - answer_followup_question   (the "Ask" tab)
+  - grade_short_answer         (the "Short answer" tab)
 
 Talks to Ollama Cloud (https://ollama.com) through its OpenAI-compatible
-/v1/chat/completions endpoint, using the `openai` Python SDK pointed at
-Ollama's base URL.
+/v1/chat/completions endpoint via the `openai` SDK.
 """
 
 import json
 import os
 import re
-from typing import Any
+from typing import Any, Optional
 
 from openai import OpenAI
 
@@ -33,6 +36,12 @@ client = OpenAI(
     api_key=os.environ.get("OLLAMA_API_KEY", ""),
 )
 
+# Chunking: keep chunks small enough for reliable extraction, capped so a
+# single upload can't blow the time/cost budget in one request. This still
+# covers roughly 60k+ characters of source material end to end.
+CHUNK_SIZE = 9000
+MAX_CHUNKS = 8
+
 
 def _extract_json(raw_text: str) -> Any:
     """Strip markdown code fences / stray prose and parse JSON safely."""
@@ -40,7 +49,6 @@ def _extract_json(raw_text: str) -> Any:
     cleaned = re.sub(r"^```(json)?", "", cleaned.strip())
     cleaned = re.sub(r"```$", "", cleaned.strip())
     cleaned = cleaned.strip()
-    # In case the model adds any preamble, grab the outermost {...} block.
     if not cleaned.startswith("{"):
         start = cleaned.find("{")
         end = cleaned.rfind("}")
@@ -50,12 +58,6 @@ def _extract_json(raw_text: str) -> Any:
 
 
 def _chat_json(system_prompt: str, user_prompt: str, max_tokens: int) -> dict:
-    """Call the model and parse a JSON object out of its response.
-
-    Uses response_format=json_object where the model supports it (most
-    current Ollama Cloud models do); falls back to prompt-only JSON
-    extraction if the server rejects the parameter.
-    """
     try:
         response = client.chat.completions.create(
             model=MODEL,
@@ -67,7 +69,6 @@ def _chat_json(system_prompt: str, user_prompt: str, max_tokens: int) -> dict:
             ],
         )
     except Exception:
-        # Some models/hosts don't support response_format - retry without it.
         response = client.chat.completions.create(
             model=MODEL,
             max_tokens=max_tokens,
@@ -81,15 +82,100 @@ def _chat_json(system_prompt: str, user_prompt: str, max_tokens: int) -> dict:
     return _extract_json(raw_text)
 
 
-STUDY_KIT_SYSTEM_PROMPT = """You are an expert study-skills tutor and instructional designer \
-helping a college student turn raw course material into an effective study kit.
+def _chat_text(system_prompt: str, user_prompt: str, max_tokens: int) -> str:
+    response = client.chat.completions.create(
+        model=MODEL,
+        max_tokens=max_tokens,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+    return (response.choices[0].message.content or "").strip()
 
-You must respond with ONLY a single JSON object. No preamble, no markdown code fences, \
-no commentary before or after. The JSON must match this exact shape:
 
+# ---------------------------------------------------------------------------
+# Chunking
+# ---------------------------------------------------------------------------
+
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, max_chunks: int = MAX_CHUNKS) -> list:
+    """Split text into paragraph-aware chunks so long material still gets
+    fully covered instead of silently cut off at some character limit."""
+    text = text.strip()
+    if len(text) <= chunk_size:
+        return [text]
+
+    paragraphs = re.split(r"\n\s*\n", text)
+    chunks, current = [], ""
+    for para in paragraphs:
+        if len(current) + len(para) + 2 <= chunk_size:
+            current = f"{current}\n\n{para}" if current else para
+        else:
+            if current:
+                chunks.append(current)
+            if len(para) > chunk_size:
+                for i in range(0, len(para), chunk_size):
+                    chunks.append(para[i : i + chunk_size])
+                current = ""
+            else:
+                current = para
+    if current:
+        chunks.append(current)
+
+    if len(chunks) > max_chunks:
+        head = chunks[: max_chunks - 1]
+        tail = "\n\n".join(chunks[max_chunks - 1 :])
+        head.append(tail[: chunk_size * 3])
+        chunks = head
+
+    return chunks
+
+
+# ---------------------------------------------------------------------------
+# Stage 1 (map): per-chunk concept extraction
+# ---------------------------------------------------------------------------
+
+CHUNK_EXTRACT_SYSTEM_PROMPT = """You are helping build a comprehensive study guide. You will be \
+given ONE excerpt (part of a larger document). Extract every distinct concept, term, or idea a \
+student would need to know from THIS excerpt to be tested on it — be exhaustive, not just the \
+headline ideas. A missed topic here means a student is unprepared for a question on the exam, \
+so err on the side of including more, minor concepts rather than fewer.
+
+Respond with ONLY a JSON object of this shape, no markdown fences, no commentary:
+{
+  "concepts": [
+    { "title": "short concept name", "description": "1-2 sentence plain-language explanation" }
+  ]
+}
+"""
+
+
+def extract_chunk_concepts(chunk: str, chunk_index: int, total_chunks: int) -> dict:
+    user_prompt = (
+        f"Excerpt {chunk_index + 1} of {total_chunks} from the source material:\n\n{chunk}"
+    )
+    return _chat_json(CHUNK_EXTRACT_SYSTEM_PROMPT, user_prompt, max_tokens=2000)
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 (reduce): synthesize the final concept map + summary
+# ---------------------------------------------------------------------------
+
+SYNTHESIZE_SYSTEM_PROMPT = """You are an expert study-skills tutor building the final version of a \
+student's study kit. You are given (a) a raw, possibly-duplicated list of concepts extracted from \
+every part of a longer document, and (b) a sample of the original text for tone and grounding.
+
+Your job: merge and deduplicate the raw concept list into a clean, well-organized concept map, and \
+write a cheat-sheet summary. CRITICAL: every distinct topic in the raw list must be represented \
+somewhere in your final concept map — do not drop minor concepts for the sake of brevity. If two \
+entries clearly describe the same idea, merge them into one; if they are genuinely different, keep \
+both, even if there end up being many concepts. Comprehensive coverage matters more than a short list \
+— a student's grade depends on nothing being missed.
+
+Respond with ONLY a JSON object of this shape, no markdown fences, no commentary:
 {
   "title": "short descriptive title for this material",
-  "summary": "a 150-250 word cheat-sheet summary a student could review in 2 minutes before an exam",
+  "summary": "a 150-300 word cheat-sheet summary a student could review in a few minutes before an exam, covering every major topic",
   "concepts": [
     {
       "id": "c1",
@@ -97,65 +183,153 @@ no commentary before or after. The JSON must match this exact shape:
       "description": "1-2 sentence plain-language explanation",
       "parent_id": null
     }
-  ],
+  ]
+}
+
+Use parent_id to show genuine hierarchy (e.g. a broad theory as the parent of specific mechanisms \
+under it). Most concepts can have parent_id: null if the material is fairly flat.
+"""
+
+
+def synthesize_kit(chunk_concept_lists: list, source_sample: str) -> dict:
+    raw_dump = json.dumps(
+        {"raw_concepts_by_excerpt": chunk_concept_lists}, ensure_ascii=False, indent=1
+    )
+    user_prompt = (
+        f"Raw concepts extracted from every part of the document:\n{raw_dump}\n\n"
+        f"Sample of the original source text (for tone/grounding):\n{source_sample}"
+    )
+    return _chat_json(SYNTHESIZE_SYSTEM_PROMPT, user_prompt, max_tokens=4000)
+
+
+# ---------------------------------------------------------------------------
+# Stage 3: flashcards
+# ---------------------------------------------------------------------------
+
+FLASHCARDS_SYSTEM_PROMPT = """You are generating spaced-repetition flashcards from a finalized \
+concept map. Every concept listed must be covered by at least one flashcard — more for concepts \
+whose description suggests they're complex or have multiple parts. Missing a concept here means a \
+student won't get to practice it, so be thorough rather than minimal.
+
+Respond with ONLY a JSON object, no markdown fences, no commentary:
+{
   "flashcards": [
-    {
-      "question": "a specific, testable question",
-      "answer": "a concise, correct answer",
-      "concept_id": "c1"
-    }
-  ],
+    { "question": "a specific, testable question", "answer": "a concise, correct answer", "concept_id": "c1" }
+  ]
+}
+"""
+
+
+def generate_flashcards(concepts: list, summary: str) -> dict:
+    user_prompt = (
+        f"Summary:\n{summary}\n\nConcepts (cover every one):\n"
+        f"{json.dumps(concepts, ensure_ascii=False, indent=1)}"
+    )
+    return _chat_json(FLASHCARDS_SYSTEM_PROMPT, user_prompt, max_tokens=3000)
+
+
+# ---------------------------------------------------------------------------
+# Stage 4: multiple-choice quiz
+# ---------------------------------------------------------------------------
+
+QUIZ_SYSTEM_PROMPT = """You are generating a multiple-choice quiz from a finalized concept map. \
+Every concept listed must be tested by at least one question — this quiz is how a student finds \
+out what they don't know yet, so skipping a concept means they go into an exam blind on it. Favor \
+questions that require applying or distinguishing ideas over pure recall. Distractors (wrong \
+options) should be plausible, not obviously wrong.
+
+Respond with ONLY a JSON object, no markdown fences, no commentary:
+{
   "quiz": [
     {
-      "question": "a multiple choice question testing understanding, not just recall",
+      "question": "...",
       "options": ["option A", "option B", "option C", "option D"],
       "correct_index": 0,
       "concept_id": "c1"
     }
   ]
 }
-
-Rules:
-- Identify 5-10 core concepts. Use parent_id to show real hierarchy (e.g. a broad theory \
-as the parent of two specific mechanisms) — most concepts can have parent_id: null if the \
-material is fairly flat, but nest wherever there is a genuine sub-idea relationship.
-- Generate 8-12 flashcards spread across the concepts, not clustered on one.
-- Generate 5-8 quiz questions, each tagged with the concept_id it tests. Favor questions \
-that require applying or distinguishing ideas over pure memorization.
-- Ground every question and flashcard directly in the provided material. Do not invent \
-facts that are not supported by the source text.
-- Keep language clear and student-facing, not academic jargon for its own sake.
 """
 
 
-def build_study_kit(source_text: str) -> dict:
-    """Call the model once to turn source material into a full study kit."""
-    if len(source_text.strip()) < 40:
-        raise ValueError("Source text is too short to build a meaningful study kit.")
-
-    # Guard against extremely long uploads blowing the context / cost budget.
-    trimmed = source_text[:60000]
-
-    data = _chat_json(
-        system_prompt=STUDY_KIT_SYSTEM_PROMPT,
-        user_prompt=f"Here is the source material:\n\n{trimmed}",
-        max_tokens=4000,
+def generate_quiz(concepts: list, summary: str) -> dict:
+    user_prompt = (
+        f"Summary:\n{summary}\n\nConcepts (test every one):\n"
+        f"{json.dumps(concepts, ensure_ascii=False, indent=1)}"
     )
-    return data
+    return _chat_json(QUIZ_SYSTEM_PROMPT, user_prompt, max_tokens=3500)
 
+
+# ---------------------------------------------------------------------------
+# Stage 5: short-answer / free-response questions
+# ---------------------------------------------------------------------------
+
+SHORT_ANSWER_SYSTEM_PROMPT = """You are generating short-answer (free-response) study questions \
+from a finalized concept map. Unlike multiple choice, these should require the student to explain, \
+compare, or apply a concept in their own words — deeper than recall. Aim for 4-8 questions spread \
+across the most important concepts (you don't need one per concept here; pick the ones that most \
+reward being able to explain them). For each question, include a model answer that will be used to \
+grade the student's own response later, covering the key points a correct answer must include.
+
+Respond with ONLY a JSON object, no markdown fences, no commentary:
+{
+  "short_answer": [
+    { "question": "...", "model_answer": "the key points a strong answer should cover", "concept_id": "c1" }
+  ]
+}
+"""
+
+
+def generate_short_answer_questions(concepts: list, summary: str) -> dict:
+    user_prompt = (
+        f"Summary:\n{summary}\n\nConcepts:\n{json.dumps(concepts, ensure_ascii=False, indent=1)}"
+    )
+    return _chat_json(SHORT_ANSWER_SYSTEM_PROMPT, user_prompt, max_tokens=2500)
+
+
+# ---------------------------------------------------------------------------
+# Follow-up Q&A ("Ask" tab)
+# ---------------------------------------------------------------------------
+
+ASK_SYSTEM_PROMPT = """You are a patient, encouraging study tutor. A student is asking a follow-up \
+question about material they're studying. Answer clearly and directly, grounded ONLY in the source \
+material and summary provided. If the material doesn't cover something the student asks about, say \
+so honestly rather than inventing an answer. Keep answers focused — a few sentences to a short \
+paragraph, not an essay, unless the question genuinely requires more.
+"""
+
+
+def answer_followup_question(
+    source_text: str, summary: str, question: str, prior_qa: Optional[list] = None
+) -> str:
+    trimmed_source = source_text[:40000]
+    history_block = ""
+    if prior_qa:
+        recent = prior_qa[-4:]
+        history_block = "\n\nRecent Q&A on this material (for context):\n" + "\n".join(
+            f"Q: {qa['question']}\nA: {qa['answer']}" for qa in recent
+        )
+
+    user_prompt = (
+        f"Source material:\n{trimmed_source}\n\nSummary:\n{summary}{history_block}\n\n"
+        f"Student's question: {question}"
+    )
+    return _chat_text(ASK_SYSTEM_PROMPT, user_prompt, max_tokens=700)
+
+
+# ---------------------------------------------------------------------------
+# Targeted re-explanation (used by the MCQ quiz on a wrong answer)
+# ---------------------------------------------------------------------------
 
 EXPLAIN_SYSTEM_PROMPT = """You are a patient, encouraging tutor. A student just answered a \
-quiz question incorrectly. Your job is to re-explain the specific concept they missed, \
-grounded ONLY in the source material provided, in a way that addresses their likely \
-misunderstanding — not a generic textbook definition.
+quiz question incorrectly. Re-explain the specific concept they missed, grounded ONLY in the \
+source material provided, addressing their likely misunderstanding — not a generic definition.
 
-Respond with ONLY a JSON object of this shape:
+Respond with ONLY a JSON object, no markdown fences, no commentary:
 {
   "explanation": "a focused, 3-5 sentence re-explanation targeting the misunderstanding",
-  "analogy": "one short concrete analogy or example that makes the concept stick",
-  "try_again_question": "a new, simpler question testing the same concept, to check understanding"
+  "analogy": "one short concrete analogy or example that makes the concept stick"
 }
-No markdown fences, no extra commentary.
 """
 
 
@@ -167,9 +341,7 @@ def generate_targeted_explanation(
     student_answer: str,
     correct_answer: str,
 ) -> dict:
-    """Generate a targeted re-explanation for a missed quiz concept."""
-    trimmed = source_text[:60000]
-
+    trimmed = source_text[:40000]
     user_prompt = f"""Source material:
 {trimmed}
 
@@ -178,11 +350,29 @@ Quiz question: {question}
 Student's (incorrect) answer: {student_answer}
 Correct answer: {correct_answer}
 
-Re-explain this concept for the student, addressing why their answer likely felt right \
-but wasn't."""
+Re-explain this concept for the student, addressing why their answer likely felt right but wasn't."""
+    return _chat_json(EXPLAIN_SYSTEM_PROMPT, user_prompt, max_tokens=600)
 
-    return _chat_json(
-        system_prompt=EXPLAIN_SYSTEM_PROMPT,
-        user_prompt=user_prompt,
-        max_tokens=600,
+
+# ---------------------------------------------------------------------------
+# Short-answer grading ("Short answer" tab)
+# ---------------------------------------------------------------------------
+
+GRADE_SYSTEM_PROMPT = """You are a fair, encouraging tutor grading a student's short-answer \
+response against a model answer. Judge whether the student's answer captures the key points, not \
+whether the wording matches exactly. Be specific about what they got right and what's missing.
+
+Respond with ONLY a JSON object, no markdown fences, no commentary:
+{
+  "verdict": "correct" | "partial" | "incorrect",
+  "feedback": "2-4 sentences: what they got right, what's missing or wrong, and the key point to remember"
+}
+"""
+
+
+def grade_short_answer(question: str, model_answer: str, student_answer: str) -> dict:
+    user_prompt = (
+        f"Question: {question}\n\nModel answer (key points expected): {model_answer}\n\n"
+        f"Student's answer: {student_answer}"
     )
+    return _chat_json(GRADE_SYSTEM_PROMPT, user_prompt, max_tokens=500)
