@@ -11,6 +11,8 @@ const state = {
   quizAnswered: false,
 };
 
+const API_BASE_URL = "https://studyforge-pm3c.onrender.com";
+
 const loadingMessages = [
   "Heating the material\u2026",
   "Extracting the core concepts\u2026",
