@@ -50,9 +50,9 @@ class ExplainRequest(BaseModel):
     correct_answer: str
 
 
-@app.get("/api/health")
+@app.get("/")
 def health() -> dict:
-    return {"status": "ok"}
+    return {"message": "StudyForge API is healthy."}
 
 
 @app.post("/api/process")
