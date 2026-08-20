@@ -3,7 +3,7 @@ auth.py
 Password hashing (PBKDF2, stdlib only) and JWT session tokens for
 StudyForge's optional login. No account is required to use the app —
 this only powers the "sync my history across devices" flow.
-"""
+
 
 import binascii
 import hashlib
@@ -51,3 +51,4 @@ def decode_token(token: str):
         return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     except jwt.PyJWTError:
         return None
+        """

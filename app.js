@@ -114,7 +114,7 @@ el.themeSelect.addEventListener("change", () => {
 
 // ---------- Auth UI ----------
 
-function renderAuthArea() {
+/*function renderAuthArea() {
   const email = getEmail();
   el.authArea.innerHTML = "";
   if (email) {
@@ -178,7 +178,7 @@ el.authForm.addEventListener("submit", async (e) => {
     el.authError.hidden = false;
   }
 });
-
+*/
 // ---------- History ----------
 
 el.historyBtn.addEventListener("click", () => {
