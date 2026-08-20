@@ -2,9 +2,13 @@
 main.py
 FastAPI backend for StudyForge.
 
+No login system - every student is identified by a guest ID their browser
+generates and stores in localStorage (see frontend/app.js). History and
+recovery work on that device automatically.
+
 Run locally:
   pip install -r requirements.txt
-  cp .env.example .env   # then add your OLLAMA_API_KEY (and ideally JWT_SECRET)
+  cp .env.example .env   # then add your OLLAMA_API_KEY
   uvicorn main:app --reload --port 8000
 """
 
@@ -18,7 +22,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pypdf import PdfReader
 
-import auth
 import db
 import jobs
 import pipeline
@@ -37,26 +40,10 @@ app.add_middleware(
 )
 
 
-# =============================================================================
-# Identity: a request is either an authenticated user or an anonymous guest.
-# Guests get full history/recovery too, keyed by a client-generated UUID -
-# login is only needed to make that history follow you across devices.
-# =============================================================================
-
-def get_identity(
-    authorization: Optional[str] = Header(None),
-    x_guest_id: Optional[str] = Header(None),
-):
-    if authorization and authorization.lower().startswith("bearer "):
-        token = authorization.split(" ", 1)[1].strip()
-        payload = auth.decode_token(token)
-        if payload:
-            return {"owner_type": "user", "owner_id": payload["sub"], "email": payload.get("email")}
-
-    if x_guest_id:
-        return {"owner_type": "guest", "owner_id": x_guest_id, "email": None}
-
-    raise HTTPException(400, "Missing identity: send an Authorization bearer token or X-Guest-Id header.")
+def get_guest_id(x_guest_id: Optional[str] = Header(None)) -> str:
+    if not x_guest_id:
+        raise HTTPException(400, "Missing X-Guest-Id header.")
+    return x_guest_id
 
 
 def require_ollama_key():
@@ -67,16 +54,6 @@ def require_ollama_key():
 # =============================================================================
 # Schemas
 # =============================================================================
-
-class SignupRequest(BaseModel):
-    email: str
-    password: str
-
-
-class LoginRequest(BaseModel):
-    email: str
-    password: str
-
 
 class ProcessTextRequest(BaseModel):
     text: str
@@ -111,52 +88,10 @@ def health() -> dict:
 
 
 # =============================================================================
-# Auth (optional — only needed for cross-device history recovery)
-# =============================================================================
-
-@app.post("/api/auth/signup")
-def signup(req: SignupRequest, x_guest_id: Optional[str] = Header(None)) -> dict:
-    email = req.email.strip().lower()
-    if "@" not in email or len(req.password) < 8:
-        raise HTTPException(400, "Enter a valid email and a password of at least 8 characters.")
-    if db.get_user_by_email(email):
-        raise HTTPException(409, "An account with that email already exists.")
-
-    user_id = db.create_user(email, auth.hash_password(req.password))
-
-    if x_guest_id:
-        db.migrate_guest_kits(x_guest_id, user_id)
-
-    token = auth.create_token(user_id, email)
-    return {"token": token, "email": email}
-
-
-@app.post("/api/auth/login")
-def login(req: LoginRequest, x_guest_id: Optional[str] = Header(None)) -> dict:
-    email = req.email.strip().lower()
-    user = db.get_user_by_email(email)
-    if not user or not auth.verify_password(req.password, user["password_hash"]):
-        raise HTTPException(401, "Incorrect email or password.")
-
-    if x_guest_id:
-        db.migrate_guest_kits(x_guest_id, user["id"])
-
-    token = auth.create_token(user["id"], email)
-    return {"token": token, "email": email}
-
-
-@app.get("/api/auth/me")
-def me(identity: dict = Depends(get_identity)) -> dict:
-    if identity["owner_type"] != "user":
-        raise HTTPException(401, "Not logged in.")
-    return {"email": identity["email"]}
-
-
-# =============================================================================
 # Study kit generation (job-based, so progress reflects real work)
 # =============================================================================
 
-async def _run_build_job(job_id: str, source_text: str, owner_type: str, owner_id: str) -> None:
+async def _run_build_job(job_id: str, source_text: str, guest_id: str) -> None:
     import asyncio
 
     try:
@@ -200,7 +135,7 @@ async def _run_build_job(job_id: str, source_text: str, owner_type: str, owner_i
 
         jobs.update_job(job_id, stage="saving", label="Saving your study kit\u2026")
         kit_id = await asyncio.to_thread(
-            db.create_kit, owner_type, owner_id, kit.get("title", "Untitled study kit"), source_text, kit
+            db.create_kit, guest_id, kit.get("title", "Untitled study kit"), source_text, kit
         )
         kit["id"] = kit_id
 
@@ -219,19 +154,17 @@ async def _run_build_job(job_id: str, source_text: str, owner_type: str, owner_i
 
 
 @app.post("/api/process")
-async def process_text(req: ProcessTextRequest, identity: dict = Depends(get_identity)) -> dict:
+async def process_text(req: ProcessTextRequest, guest_id: str = Depends(get_guest_id)) -> dict:
     require_ollama_key()
     import asyncio
 
     job_id = jobs.create_job()
-    asyncio.create_task(_run_build_job(job_id, req.text, identity["owner_type"], identity["owner_id"]))
+    asyncio.create_task(_run_build_job(job_id, req.text, guest_id))
     return {"job_id": job_id}
 
 
 @app.post("/api/process-file")
-async def process_file(
-    file: UploadFile = File(...), identity: dict = Depends(get_identity)
-) -> dict:
+async def process_file(file: UploadFile = File(...), guest_id: str = Depends(get_guest_id)) -> dict:
     require_ollama_key()
     import asyncio
 
@@ -248,7 +181,7 @@ async def process_file(
         text = raw.decode("utf-8", errors="ignore")
 
     job_id = jobs.create_job()
-    asyncio.create_task(_run_build_job(job_id, text, identity["owner_type"], identity["owner_id"]))
+    asyncio.create_task(_run_build_job(job_id, text, guest_id))
     return {"job_id": job_id}
 
 
@@ -265,14 +198,14 @@ def get_job_status(job_id: str) -> dict:
 # =============================================================================
 
 @app.get("/api/kits")
-def list_kits(identity: dict = Depends(get_identity)) -> dict:
-    return {"kits": db.list_kits(identity["owner_type"], identity["owner_id"])}
+def list_kits(guest_id: str = Depends(get_guest_id)) -> dict:
+    return {"kits": db.list_kits(guest_id)}
 
 
 @app.get("/api/kits/{kit_id}")
-def get_kit_detail(kit_id: int, identity: dict = Depends(get_identity)) -> dict:
+def get_kit_detail(kit_id: int, guest_id: str = Depends(get_guest_id)) -> dict:
     row = db.get_kit(kit_id)
-    if not row or row["owner_type"] != identity["owner_type"] or row["owner_id"] != identity["owner_id"]:
+    if not row or row["guest_id"] != guest_id:
         raise HTTPException(404, "Study kit not found.")
     kit = row["kit"]
     kit["id"] = row["id"]
@@ -281,9 +214,9 @@ def get_kit_detail(kit_id: int, identity: dict = Depends(get_identity)) -> dict:
 
 
 @app.delete("/api/kits/{kit_id}")
-def remove_kit(kit_id: int, identity: dict = Depends(get_identity)) -> dict:
+def remove_kit(kit_id: int, guest_id: str = Depends(get_guest_id)) -> dict:
     row = db.get_kit(kit_id)
-    if not row or row["owner_type"] != identity["owner_type"] or row["owner_id"] != identity["owner_id"]:
+    if not row or row["guest_id"] != guest_id:
         raise HTTPException(404, "Study kit not found.")
     db.delete_kit(kit_id)
     return {"deleted": True}
@@ -294,10 +227,10 @@ def remove_kit(kit_id: int, identity: dict = Depends(get_identity)) -> dict:
 # =============================================================================
 
 @app.post("/api/kits/{kit_id}/ask")
-def ask_followup(kit_id: int, req: AskRequest, identity: dict = Depends(get_identity)) -> dict:
+def ask_followup(kit_id: int, req: AskRequest, guest_id: str = Depends(get_guest_id)) -> dict:
     require_ollama_key()
     row = db.get_kit(kit_id)
-    if not row or row["owner_type"] != identity["owner_type"] or row["owner_id"] != identity["owner_id"]:
+    if not row or row["guest_id"] != guest_id:
         raise HTTPException(404, "Study kit not found.")
 
     kit = row["kit"]
@@ -319,10 +252,10 @@ def ask_followup(kit_id: int, req: AskRequest, identity: dict = Depends(get_iden
 # =============================================================================
 
 @app.post("/api/kits/{kit_id}/grade-short-answer")
-def grade_short_answer(kit_id: int, req: GradeRequest, identity: dict = Depends(get_identity)) -> dict:
+def grade_short_answer(kit_id: int, req: GradeRequest, guest_id: str = Depends(get_guest_id)) -> dict:
     require_ollama_key()
     row = db.get_kit(kit_id)
-    if not row or row["owner_type"] != identity["owner_type"] or row["owner_id"] != identity["owner_id"]:
+    if not row or row["guest_id"] != guest_id:
         raise HTTPException(404, "Study kit not found.")
 
     short_answer = row["kit"].get("short_answer", [])
@@ -342,10 +275,10 @@ def grade_short_answer(kit_id: int, req: GradeRequest, identity: dict = Depends(
 # =============================================================================
 
 @app.post("/api/explain")
-def explain(req: ExplainRequest, identity: dict = Depends(get_identity)) -> dict:
+def explain(req: ExplainRequest, guest_id: str = Depends(get_guest_id)) -> dict:
     require_ollama_key()
     row = db.get_kit(req.kit_id)
-    if not row or row["owner_type"] != identity["owner_type"] or row["owner_id"] != identity["owner_id"]:
+    if not row or row["guest_id"] != guest_id:
         raise HTTPException(404, "Study kit not found.")
 
     try:

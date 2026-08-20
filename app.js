@@ -13,7 +13,7 @@ const state = {
 
 window.API_BASE_URL = "https://studyforge-pm3c.onrender.com";
 
-// ---------- Identity: guest UUID + optional login token ----------
+// ---------- Identity: anonymous guest UUID stored in this browser ----------
 
 function getGuestId() {
   let id = localStorage.getItem("studyforge_guest_id");
@@ -24,32 +24,9 @@ function getGuestId() {
   return id;
 }
 
-function getToken() {
-  return localStorage.getItem("studyforge_token");
-}
-
-function getEmail() {
-  return localStorage.getItem("studyforge_email");
-}
-
-function setSession(token, email) {
-  localStorage.setItem("studyforge_token", token);
-  localStorage.setItem("studyforge_email", email);
-  renderAuthArea();
-}
-
-function clearSession() {
-  localStorage.removeItem("studyforge_token");
-  localStorage.removeItem("studyforge_email");
-  renderAuthArea();
-}
-
 function identityHeaders(includeJson) {
-  const headers = {};
+  const headers = { "X-Guest-Id": getGuestId() };
   if (includeJson) headers["Content-Type"] = "application/json";
-  const token = getToken();
-  if (token) headers["Authorization"] = `Bearer ${token}`;
-  else headers["X-Guest-Id"] = getGuestId();
   return headers;
 }
 
@@ -92,15 +69,6 @@ const el = {
   askForm: document.getElementById("ask-form"),
   askInput: document.getElementById("ask-input"),
   themeSelect: document.getElementById("theme-select"),
-  authArea: document.getElementById("auth-area"),
-  authModal: document.getElementById("auth-modal"),
-  authForm: document.getElementById("auth-form"),
-  authEmail: document.getElementById("auth-email"),
-  authPassword: document.getElementById("auth-password"),
-  authError: document.getElementById("auth-error"),
-  authSubmit: document.getElementById("auth-submit"),
-  authCancel: document.getElementById("auth-cancel"),
-  authModalTitle: document.getElementById("auth-modal-title"),
 };
 
 // ---------- Theme ----------
@@ -112,73 +80,6 @@ el.themeSelect.addEventListener("change", () => {
   localStorage.setItem("studyforge_theme", theme);
 });
 
-// ---------- Auth UI ----------
-
-/*function renderAuthArea() {
-  const email = getEmail();
-  el.authArea.innerHTML = "";
-  if (email) {
-    const span = document.createElement("span");
-    span.textContent = email;
-    const logoutBtn = document.createElement("button");
-    logoutBtn.className = "btn-ghost";
-    logoutBtn.textContent = "Log out";
-    logoutBtn.addEventListener("click", clearSession);
-    el.authArea.appendChild(span);
-    el.authArea.appendChild(logoutBtn);
-  } else {
-    const loginBtn = document.createElement("button");
-    loginBtn.className = "btn-ghost";
-    loginBtn.textContent = "Log in";
-    loginBtn.addEventListener("click", () => openAuthModal("login"));
-    el.authArea.appendChild(loginBtn);
-  }
-}
-
-let authMode = "login";
-
-function openAuthModal(mode) {
-  authMode = mode;
-  document.querySelectorAll(".modal-tab").forEach((t) => {
-    t.classList.toggle("active", t.dataset.mode === mode);
-  });
-  el.authModalTitle.textContent = mode === "login" ? "Log in" : "Sign up";
-  el.authSubmit.textContent = mode === "login" ? "Log in" : "Sign up";
-  el.authError.hidden = true;
-  el.authForm.reset();
-  el.authModal.hidden = false;
-}
-
-document.querySelectorAll(".modal-tab").forEach((tab) => {
-  tab.addEventListener("click", () => openAuthModal(tab.dataset.mode));
-});
-
-el.authCancel.addEventListener("click", () => (el.authModal.hidden = true));
-
-el.authForm.addEventListener("submit", async (e) => {
-  e.preventDefault();
-  el.authError.hidden = true;
-  const email = el.authEmail.value.trim();
-  const password = el.authPassword.value;
-  const endpoint = authMode === "login" ? "/api/auth/login" : "/api/auth/signup";
-
-  try {
-    const res = await fetch(`${API_BASE_URL}${endpoint}`, {
-      method: "POST",
-      headers: identityHeaders(true),
-      body: JSON.stringify({ email, password }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "Something went wrong.");
-    setSession(data.token, data.email);
-    el.authModal.hidden = true;
-    if (!el.history.hidden) loadHistory();
-  } catch (err) {
-    el.authError.textContent = err.message;
-    el.authError.hidden = false;
-  }
-});
-*/
 // ---------- History ----------
 
 el.historyBtn.addEventListener("click", () => {
@@ -812,5 +713,4 @@ function cssEscape(str) {
 }
 
 // ---------- Init ----------
-
-renderAuthArea();
+// Theme is applied inline in <head> before paint; nothing else needed on load.

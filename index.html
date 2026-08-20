@@ -42,7 +42,6 @@
         </select>
       </div>
       <button id="history-btn" class="btn-ghost">My kits</button>
-      <div id="auth-area"></div>
     </div>
   </header>
 
@@ -55,6 +54,7 @@
         <button id="history-close" class="btn-ghost">&#8592; Back</button>
       </div>
       <p id="history-empty" class="panel-hint" hidden>Nothing forged yet — go make your first study kit.</p>
+      <p class="panel-hint">Saved on this device only — clearing your browser data will clear this history too.</p>
       <ul id="history-list" class="history-list"></ul>
     </section>
 
@@ -175,29 +175,6 @@
     </section>
 
   </main>
-
-  <!-- ============ AUTH MODAL ============ -->
-  <div id="auth-modal" class="modal-backdrop" hidden>
-    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="auth-modal-title">
-      <div class="modal-tabs">
-        <button class="modal-tab active" data-mode="login">Log in</button>
-        <button class="modal-tab" data-mode="signup">Sign up</button>
-      </div>
-      <h2 id="auth-modal-title" class="modal-title">Log in</h2>
-      <p class="modal-sub">Optional — only needed to sync your study kits across devices. Everything works without an account too.</p>
-      <form id="auth-form">
-        <label class="field-label" for="auth-email">Email</label>
-        <input id="auth-email" type="email" required autocomplete="email" />
-        <label class="field-label" for="auth-password">Password</label>
-        <input id="auth-password" type="password" required autocomplete="current-password" minlength="8" />
-        <p id="auth-error" class="error-msg" hidden></p>
-        <div class="modal-actions">
-          <button type="button" id="auth-cancel" class="btn-ghost">Cancel</button>
-          <button type="submit" id="auth-submit" class="btn-primary">Log in</button>
-        </div>
-      </form>
-    </div>
-  </div>
 
   <footer class="site-footer">
     <p>Built for the August AI Challenge &middot; StudyForge</p>
