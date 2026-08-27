@@ -65,21 +65,46 @@ def _extract_json(raw_text: str) -> Any:
     return obj
 
 
-def _repair_truncated_json(raw_text: str) -> str:
-    """Best-effort repair for a response that got cut off mid-generation
-    (e.g. hit the token limit mid-string or mid-object). Rather than trying
-    to guess how to close a half-written field - which can produce
-    plausible-looking but wrong JSON - this walks the text and remembers the
-    last point where a full element had just been completed (right before a
-    top-level comma), then closes brackets from there. Worst case it drops
-    the one in-progress item that got cut off; it never fabricates data."""
+def _sanitize_json_text(raw_text: str) -> str:
+    """Fix common LLM JSON formatting mistakes that aren't truncation: a
+    trailing comma before a closing bracket/brace, a stray doubled-up comma
+    between elements, and stray raw control characters inside the text (all
+    invalid per the JSON spec, and safe to fix without risking corrupting
+    legitimate string content). Fixing these in place preserves every item
+    in the response, instead of falling through to the truncating repair
+    step and losing everything after the mistake."""
     text = _strip_to_json_start(raw_text)
+    text = re.sub(r",(\s*[}\]])", r"\1", text)
+    text = re.sub(r",(\s*,)+", ",", text)
+    text = "".join(ch for ch in text if ch == "\n" or ch == "\t" or ord(ch) >= 0x20)
+    return text
+
+
+def _repair_json_before(raw_text: str, error_pos: Optional[int] = None) -> str:
+    """Best-effort repair for a response that's broken somewhere - whether it
+    got cut off mid-generation (hit the token limit mid-string/mid-object) or
+    has a mid-stream formatting mistake (stray token, malformed entry, etc).
+
+    Critically, this only scans up to `error_pos` (the offset json.JSONDecoder
+    reported as where parsing actually failed), not the whole text. Scanning
+    the whole string regardless of where the defect is would let corrupted
+    content that isn't at the very end survive into the "repaired" result,
+    reproducing the exact same error after cutting. Limiting the scan to the
+    known-good prefix avoids that: it walks the text up to error_pos and
+    remembers the last point a full element had just been completed (right
+    before a comma), then closes brackets from there. Worst case it drops the
+    one item that was mid-write when things broke; it never fabricates data.
+    """
+    text = _strip_to_json_start(raw_text)
+    limit = len(text) if error_pos is None else min(error_pos, len(text))
+
     stack: list = []
     in_string = False
     escape = False
     last_safe_cut = None  # (index, stack snapshot at that point)
 
-    for i, ch in enumerate(text):
+    for i in range(limit):
+        ch = text[i]
         if in_string:
             if escape:
                 escape = False
@@ -102,9 +127,8 @@ def _repair_truncated_json(raw_text: str) -> str:
     closers = {"{": "}", "[": "]"}
 
     if last_safe_cut is None:
-        # Nothing to safely cut back to. If we're still mid-string, terminate
-        # it so at least a partial value survives; then close whatever's open.
-        cut_text = text + '"' if in_string else text
+        cut_text = text[:limit]
+        cut_text = cut_text + '"' if in_string else cut_text
         cut_text = re.sub(r'[,:]\s*$', "", cut_text)
         remaining = list(stack)
         while remaining:
@@ -145,10 +169,24 @@ def _chat_json(system_prompt: str, user_prompt: str, max_tokens: int) -> dict:
     choice = response.choices[0]
     raw_text = choice.message.content or ""
 
-    try:
-        return _extract_json(raw_text)
-    except (ValueError, json.JSONDecodeError):
-        pass
+    def try_parse(text: str):
+        try:
+            return _extract_json(text), None
+        except (ValueError, json.JSONDecodeError) as e:
+            return None, e
+
+    obj, err = try_parse(raw_text)
+    if obj is not None:
+        return obj
+
+    # Most non-truncation failures are a stray trailing comma or smart quote -
+    # cheap to fix and much more accurate than the positional-repair fallback.
+    sanitized = _sanitize_json_text(raw_text)
+    obj, sanitized_err = try_parse(sanitized)
+    if obj is not None:
+        return obj
+    if sanitized_err is not None:
+        err = sanitized_err  # sanitizing can shift the error position - prefer the current one
 
     # If the model actually ran out of room, retrying with more headroom
     # fixes it properly instead of just salvaging a partial response.
@@ -157,18 +195,40 @@ def _chat_json(system_prompt: str, user_prompt: str, max_tokens: int) -> dict:
         bigger = min(max_tokens * 2, 8000)
         response = call(bigger)
         raw_text = response.choices[0].message.content or ""
-        try:
-            return _extract_json(raw_text)
-        except (ValueError, json.JSONDecodeError):
-            pass
 
-    # Last resort: repair whatever we got rather than fail the whole stage.
-    try:
-        return _extract_json(_repair_truncated_json(raw_text))
-    except (ValueError, json.JSONDecodeError) as e:
-        raise RuntimeError(
-            f"The model's response wasn't valid JSON and couldn't be repaired: {e}"
-        ) from e
+        obj, err = try_parse(raw_text)
+        if obj is not None:
+            return obj
+
+        sanitized = _sanitize_json_text(raw_text)
+        obj, sanitized_err = try_parse(sanitized)
+        if obj is not None:
+            return obj
+        if sanitized_err is not None:
+            err = sanitized_err
+
+    # Last resort: repair whatever we got, scanning only up to the exact
+    # position the parser choked on so any corruption there - trailing
+    # comma, stray token, mid-string cutoff, whatever - never survives into
+    # the "repaired" result, wherever in the response it happened to be.
+    sanitized = _sanitize_json_text(raw_text)
+    if err is None or getattr(err, "doc", None) != sanitized:
+        # err's position may be stale (from a smaller pre-retry response, or
+        # unset if sanitizing the final raw_text hasn't been tried yet) -
+        # get a fresh, correctly-aligned error position for this exact text.
+        _, err = try_parse(sanitized)
+
+    error_pos = getattr(err, "pos", None)
+    last_error: Exception = err or ValueError("no repair attempts ran")
+    for candidate in (sanitized, raw_text):
+        try:
+            return _extract_json(_repair_json_before(candidate, error_pos))
+        except (ValueError, json.JSONDecodeError) as e:
+            last_error = e
+
+    raise RuntimeError(
+        f"The model's response wasn't valid JSON and couldn't be repaired: {last_error}"
+    ) from last_error
 
 
 def _chat_text(system_prompt: str, user_prompt: str, max_tokens: int) -> str:
@@ -225,10 +285,12 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, max_chunks: int = MAX_CH
 # ---------------------------------------------------------------------------
 
 CHUNK_EXTRACT_SYSTEM_PROMPT = """You are helping build a comprehensive study guide. You will be \
-given ONE excerpt (part of a larger document). Extract every distinct concept, term, or idea a \
-student would need to know from THIS excerpt to be tested on it — be exhaustive, not just the \
-headline ideas. A missed topic here means a student is unprepared for a question on the exam, \
-so err on the side of including more, minor concepts rather than fewer.
+given ONE excerpt (part of a larger document). Extract the important concepts, terms, or ideas a \
+student would need to know from THIS excerpt to be tested on it — be thorough, not just the \
+headline ideas, but prioritize the concepts that most matter for an exam over minor asides.
+
+Extract at most 12 concepts from this excerpt. If the excerpt covers more than that, pick the 12 \
+most exam-relevant and distinct ideas rather than trying to capture every minor detail.
 
 Respond with ONLY a JSON object of this shape, no markdown fences, no commentary:
 {
@@ -255,11 +317,11 @@ student's study kit. You are given (a) a raw, possibly-duplicated list of concep
 every part of a longer document, and (b) a sample of the original text for tone and grounding.
 
 Your job: merge and deduplicate the raw concept list into a clean, well-organized concept map, and \
-write a cheat-sheet summary. CRITICAL: every distinct topic in the raw list must be represented \
-somewhere in your final concept map — do not drop minor concepts for the sake of brevity. If two \
-entries clearly describe the same idea, merge them into one; if they are genuinely different, keep \
-both, even if there end up being many concepts. Comprehensive coverage matters more than a short list \
-— a student's grade depends on nothing being missed.
+write a cheat-sheet summary. Merge into AT MOST 30 final concepts total — if the raw list has more \
+distinct entries than that, keep the most exam-relevant, distinct ideas and fold closely related \
+ones together into a single concept with a broader description, rather than dropping them silently. \
+Comprehensive coverage of every major topic matters more than covering every minor sub-detail \
+individually.
 
 Respond with ONLY a JSON object of this shape, no markdown fences, no commentary:
 {
@@ -314,7 +376,7 @@ def generate_flashcards(concepts: list, summary: str) -> dict:
         f"Summary:\n{summary}\n\nConcepts (cover every one):\n"
         f"{json.dumps(concepts, ensure_ascii=False, indent=1)}"
     )
-    return _chat_json(FLASHCARDS_SYSTEM_PROMPT, user_prompt, max_tokens=3500)
+    return _chat_json(FLASHCARDS_SYSTEM_PROMPT, user_prompt, max_tokens=4000)
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +408,7 @@ def generate_quiz(concepts: list, summary: str) -> dict:
         f"Summary:\n{summary}\n\nConcepts (test every one):\n"
         f"{json.dumps(concepts, ensure_ascii=False, indent=1)}"
     )
-    return _chat_json(QUIZ_SYSTEM_PROMPT, user_prompt, max_tokens=4000)
+    return _chat_json(QUIZ_SYSTEM_PROMPT, user_prompt, max_tokens=5000)
 
 
 # ---------------------------------------------------------------------------
